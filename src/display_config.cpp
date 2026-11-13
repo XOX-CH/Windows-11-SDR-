@@ -273,6 +273,63 @@ std::vector<SdrDisplay> SdrDisplayService::GetHdrDisplays() const
     return displays;
 }
 
+std::vector<std::wstring> SdrDisplayService::GetActiveGdiNames() const
+{
+    std::vector<std::wstring> names;
+
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(kQdcOnlyActivePaths, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0)
+    {
+        return names;
+    }
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(
+            kQdcOnlyActivePaths,
+            &pathCount,
+            paths.data(),
+            &modeCount,
+            modes.data(),
+            nullptr) != ERROR_SUCCESS)
+    {
+        return names;
+    }
+
+    paths.resize(pathCount);
+    for (const DISPLAYCONFIG_PATH_INFO& path : paths)
+    {
+        if ((path.flags & DISPLAYCONFIG_PATH_ACTIVE) == 0)
+        {
+            continue;
+        }
+
+        const std::wstring name = GetSourceGdiName(path);
+        if (name.empty())
+        {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (const std::wstring& existing : names)
+        {
+            if (_wcsicmp(existing.c_str(), name.c_str()) == 0)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+        {
+            names.push_back(name);
+        }
+    }
+
+    return names;
+}
+
 bool SdrDisplayService::ReadPercent(const SdrDisplay& display, int& percent, UINT32& whiteLevel) const
 {
     if (!GetWhiteLevel(display, whiteLevel))

@@ -26,6 +26,7 @@ class SdrDisplayService
 {
 public:
     std::vector<SdrDisplay> GetHdrDisplays() const;
+    std::vector<std::wstring> GetActiveGdiNames() const;
     bool ReadPercent(const SdrDisplay& display, int& percent, UINT32& whiteLevel) const;
     bool SetPercent(const SdrDisplay& display, int percent, int& appliedPercent, UINT32& appliedWhiteLevel, bool readBack = true, BYTE finalValue = 1) const;
 
