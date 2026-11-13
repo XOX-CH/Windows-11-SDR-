@@ -1,0 +1,8 @@
+# 构建中间产物
+obj/
+
+# 本地构建输出（如需发布 exe，可手动放入 bin/ 并提交）
+bin/*.pdb
+bin/*.ilk
+bin/*.exp
+bin/*.lib
