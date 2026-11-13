@@ -44,6 +44,7 @@ namespace
     constexpr UINT kTrayIconId = 1;
     constexpr UINT_PTR kHideTimerId = 1;
     constexpr UINT_PTR kSwitchTimerId = 3;
+    constexpr UINT_PTR kTrayPromoteTimerId = 4;
     constexpr int kSwitchAnimMs = 160;
     constexpr int kWindowWidthDip = 320;
     constexpr int kWindowHeightDip = 184;
@@ -300,6 +301,10 @@ namespace
         ULONGLONG eyeSwitchAnimStart = 0;
         bool eyeSwitchAnimating = false;
         int transparency = kDefaultTransparency;
+        double backdropLuminance = 1.0;
+        bool backdropMeasured = false;
+        bool promoteTrayOnStart = false;
+        int trayPromoteAttempts = 0;
         std::vector<GammaBase> gammaBases;
         std::vector<AppliedRamp> appliedRamps;
         std::mutex rampMutex;
@@ -528,6 +533,78 @@ namespace
         return RGB(red, green, blue);
     }
 
+    double ColorLuminance(COLORREF color)
+    {
+        return (0.2126 * GetRValue(color) + 0.7152 * GetGValue(color) +
+                0.0722 * GetBValue(color)) / 255.0;
+    }
+
+    // 采样窗口背后屏幕区域的平均亮度。面板/菜单是半透明玻璃，
+    // 配色要按合成后的实际亮度选择深浅，否则白底窗口下灰字和线条会看不清。
+    bool MeasureBackdropLuminance(int x, int y, int width, int height)
+    {
+        g.backdropMeasured = false;
+        if (width <= 0 || height <= 0)
+        {
+            return false;
+        }
+
+        HDC screen = GetDC(nullptr);
+        if (!screen)
+        {
+            return false;
+        }
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        HDC memory = CreateCompatibleDC(screen);
+        HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (memory && bitmap && bits)
+        {
+            HGDIOBJ old = SelectObject(memory, bitmap);
+            if (BitBlt(memory, 0, 0, width, height, screen, x, y, SRCCOPY | CAPTUREBLT))
+            {
+                constexpr int step = 6;
+                double total = 0.0;
+                int count = 0;
+                const auto* pixels = static_cast<const BYTE*>(bits);
+                for (int py = 0; py < height; py += step)
+                {
+                    const BYTE* row = pixels + static_cast<size_t>(py) * width * 4;
+                    for (int px = 0; px < width; px += step)
+                    {
+                        const BYTE* pixel = row + px * 4;
+                        total += 0.2126 * pixel[2] + 0.7152 * pixel[1] + 0.0722 * pixel[0];
+                        ++count;
+                    }
+                }
+                if (count > 0)
+                {
+                    g.backdropLuminance = total / count / 255.0;
+                    g.backdropMeasured = true;
+                }
+            }
+            SelectObject(memory, old);
+        }
+        if (bitmap)
+        {
+            DeleteObject(bitmap);
+        }
+        if (memory)
+        {
+            DeleteDC(memory);
+        }
+        ReleaseDC(nullptr, screen);
+        return g.backdropMeasured;
+    }
+
     void ShowFlyout();
     void HideFlyout();
     void HideWindowForSettings();
@@ -578,6 +655,22 @@ namespace
             reinterpret_cast<const BYTE*>(&value),
             sizeof(value));
         RegCloseKey(key);
+    }
+
+    bool SettingsKeyExists()
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                L"Software\\SdrBrightnessTray",
+                0,
+                KEY_READ,
+                &key) != ERROR_SUCCESS)
+        {
+            return false;
+        }
+        RegCloseKey(key);
+        return true;
     }
 
     bool WriteBinary(const wchar_t* subkey, const wchar_t* name, const std::vector<BYTE>& data)
@@ -691,9 +784,29 @@ namespace
         constexpr const wchar_t* personalize =
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 
-        g.lightTheme = ReadDword(personalize, L"AppsUseLightTheme", 0) != 0;
+        const bool systemLight = ReadDword(personalize, L"AppsUseLightTheme", 0) != 0;
         g.lightTaskbar = ReadDword(personalize, L"SystemUsesLightTheme", 0) != 0;
-        g.accent = ReadSystemAccent(g.lightTheme);
+
+        // 半透明玻璃的最终观感由背后内容决定：估算玻璃合成后的亮度来选深浅配色，
+        // 这样白底窗口下不会出现灰字、分割线、HDR 徽标发灰发虚的问题。
+        g.lightTheme = systemLight;
+        if (g.backdropMeasured)
+        {
+            const double alpha = SurfaceAlpha() / 255.0;
+            const COLORREF tint = systemLight
+                ? BlendColor(RGB(242, 242, 242), ReadSystemAccent(true), 10)
+                : BlendColor(RGB(22, 22, 22), ReadSystemAccent(false), 32);
+            const double surfaceLuminance =
+                alpha * ColorLuminance(tint) + (1.0 - alpha) * g.backdropLuminance;
+            g.lightTheme = surfaceLuminance > 0.5;
+        }
+
+        // 强调色只跟系统主题走，不随背景明暗变 hue；浅色面板上压暗一档保证可读。
+        g.accent = ReadSystemAccent(systemLight);
+        if (g.lightTheme && !systemLight)
+        {
+            g.accent = BlendColor(g.accent, RGB(0, 0, 0), 25);
+        }
 
         if (g.lightTheme)
         {
@@ -2698,6 +2811,95 @@ namespace
         return icon;
     }
 
+    // Windows 11 没有公开接口把托盘图标固定到任务栏，只能写 shell 的
+    // NotifyIconSettings（IsPromoted=1），再重新注册一次让 shell 读取。
+    bool PromoteTrayIconInRegistry()
+    {
+        wchar_t executable[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, executable, MAX_PATH))
+        {
+            return false;
+        }
+
+        HKEY root = nullptr;
+        if (RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                L"Control Panel\\NotifyIconSettings",
+                0,
+                KEY_READ | KEY_WRITE,
+                &root) != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        bool updated = false;
+        for (DWORD index = 0;; ++index)
+        {
+            wchar_t name[128]{};
+            DWORD nameLength = 128;
+            if (RegEnumKeyExW(
+                    root,
+                    index,
+                    name,
+                    &nameLength,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr) != ERROR_SUCCESS)
+            {
+                break;
+            }
+
+            HKEY item = nullptr;
+            if (RegOpenKeyExW(root, name, 0, KEY_READ | KEY_SET_VALUE, &item) != ERROR_SUCCESS)
+            {
+                continue;
+            }
+
+            wchar_t path[1024]{};
+            DWORD pathSize = sizeof(path);
+            DWORD type = 0;
+            if (RegQueryValueExW(
+                    item,
+                    L"ExecutablePath",
+                    nullptr,
+                    &type,
+                    reinterpret_cast<BYTE*>(path),
+                    &pathSize) == ERROR_SUCCESS &&
+                type == REG_SZ &&
+                _wcsicmp(path, executable) == 0)
+            {
+                DWORD promoted = 0;
+                DWORD promotedSize = sizeof(promoted);
+                if (RegQueryValueExW(
+                        item,
+                        L"IsPromoted",
+                        nullptr,
+                        nullptr,
+                        reinterpret_cast<BYTE*>(&promoted),
+                        &promotedSize) != ERROR_SUCCESS ||
+                    promoted == 0)
+                {
+                    const DWORD value = 1;
+                    updated =
+                        RegSetValueExW(
+                            item,
+                            L"IsPromoted",
+                            0,
+                            REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&value),
+                            sizeof(value)) == ERROR_SUCCESS;
+                }
+                RegCloseKey(item);
+                break;
+            }
+            RegCloseKey(item);
+        }
+
+        RegCloseKey(root);
+        return updated;
+    }
+
     bool AddTrayIcon()
     {
         if (g.trayAdded)
@@ -2726,7 +2928,14 @@ namespace
 
         g.notifyData.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &g.notifyData);
+
         g.trayAdded = true;
+
+        // 首次运行稍后再把图标固定到任务栏（shell 的注册表项是异步创建的）。
+        if (g.promoteTrayOnStart)
+        {
+            SetTimer(g.window, kTrayPromoteTimerId, 600, nullptr);
+        }
         return true;
     }
 
@@ -5198,6 +5407,13 @@ namespace
         }
         menu.slideStart = GetTickCount64();
 
+        // 面板没开时，菜单按自己背后的内容选深浅；面板已开就沿用它测好的配色。
+        if (!g.isOpen &&
+            MeasureBackdropLuminance(menu.target.left, menu.target.top, menu.width, menu.height))
+        {
+            LoadTheme();
+        }
+
         SetWindowPos(
             menu.window,
             HWND_TOPMOST,
@@ -5741,6 +5957,14 @@ namespace
         y = std::max(static_cast<int>(monitorInfo.rcWork.top) + margin, y);
 
         const bool wasVisible = IsWindowVisible(g.window) != FALSE;
+        if (!wasVisible)
+        {
+            // 先看这块屏幕区域现在是什么（面板还没显示），再决定深/浅配色。
+            if (MeasureBackdropLuminance(x, y, width, height))
+            {
+                LoadTheme();
+            }
+        }
         SetWindowPos(
             g.window,
             HWND_TOPMOST,
@@ -6458,6 +6682,30 @@ namespace
                 }
                 InvalidateUi();
             }
+            else if (wParam == kTrayPromoteTimerId)
+            {
+                KillTimer(window, kTrayPromoteTimerId);
+                if (PromoteTrayIconInRegistry())
+                {
+                    // 重新注册一次，让 shell 按 IsPromoted 把图标放到任务栏托盘。
+                    g.notifyData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+                    Shell_NotifyIconW(NIM_DELETE, &g.notifyData);
+                    if (Shell_NotifyIconW(NIM_ADD, &g.notifyData))
+                    {
+                        g.notifyData.uVersion = NOTIFYICON_VERSION_4;
+                        Shell_NotifyIconW(NIM_SETVERSION, &g.notifyData);
+                    }
+                    g.promoteTrayOnStart = false;
+                }
+                else if (g.promoteTrayOnStart && ++g.trayPromoteAttempts < 4)
+                {
+                    SetTimer(window, kTrayPromoteTimerId, 400, nullptr);
+                }
+                else
+                {
+                    g.promoteTrayOnStart = false;
+                }
+            }
             return 0;
 
         case kAnimFrameMessage:
@@ -6542,6 +6790,8 @@ namespace
         {
             const bool oldLightTaskbar = g.lightTaskbar;
             const bool wasLive = g.liveAcrylic;
+            // 系统主题变了就直接跟系统走，下次弹出时再按背景重新测。
+            g.backdropMeasured = false;
             LoadTheme();
             ApplyWindowAttributes();
             if (wasLive != g.liveAcrylic)
@@ -6737,6 +6987,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         ActivateExistingInstance();
         CloseHandle(singleInstance);
         return 0;
+    }
+
+    // 首次运行：默认写入开机启动项，并把托盘图标固定到任务栏。
+    if (!SettingsKeyExists())
+    {
+        SetStartupEnabled(true);
+        WriteDword(L"Software\\SdrBrightnessTray", L"Initialized", 1);
+        g.promoteTrayOnStart = true;
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
