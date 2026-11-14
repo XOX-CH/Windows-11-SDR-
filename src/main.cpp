@@ -74,6 +74,7 @@ namespace
 
     constexpr int kMenuDisplaySettings = 1003;
     constexpr int kMenuExit = 1004;
+    constexpr int kMenuLutDither = 1005;
     constexpr int kMenuDisplayBase = 2000;
 
     constexpr UINT_PTR kMenuSlideTimerId = 2;
@@ -305,6 +306,7 @@ namespace
         bool backdropMeasured = false;
         bool promoteTrayOnStart = false;
         int trayPromoteAttempts = 0;
+        bool lutDither = true;
         std::vector<GammaBase> gammaBases;
         std::vector<AppliedRamp> appliedRamps;
         std::mutex rampMutex;
@@ -3702,27 +3704,134 @@ namespace
         return WriteBinary(kNightLightStateKey, L"Data", output);
     }
 
-    void BuildWarmRamp(const WORD* base, int level, WORD ramp[3][256])
+    double SrgbToLinear(double value)
     {
-        const double t = std::clamp(level, 0, 100) / 100.0;
-        // 6500K -> 约 3400K：蓝通道大幅收敛、绿通道略降，红通道基本保持。
-        // Windows 会拒绝通道上限低于 32768 的 ramp，所以蓝通道最多收到 0.52。
-        const double gains[3] = {
-            1.0 - 0.01 * t,
-            1.0 - 0.15 * t,
-            1.0 - 0.48 * t};
+        return value <= 0.04045 ? value / 12.92
+                                : std::pow((value + 0.055) / 1.055, 2.4);
+    }
+
+    double LinearToSrgb(double value)
+    {
+        value = std::clamp(value, 0.0, 1.0);
+        return value <= 0.0031308 ? value * 12.92
+                                  : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+    }
+
+    // 黑体色温的 CIE 1931 色度坐标（Kim et al. 拟合，覆盖 1667K-25000K）。
+    void PlanckianChromaticity(double kelvin, double& x, double& y)
+    {
+        const double t2 = kelvin * kelvin;
+        const double t3 = t2 * kelvin;
+        if (kelvin <= 4000.0)
+        {
+            x = -0.2661239e9 / t3 - 0.2343589e6 / t2 + 0.8776956e3 / kelvin + 0.179910;
+        }
+        else
+        {
+            x = -3.0258469e9 / t3 + 2.1070379e6 / t2 + 0.2226347e3 / kelvin + 0.240390;
+        }
+
+        const double x2 = x * x;
+        const double x3 = x2 * x;
+        if (kelvin <= 2222.0)
+        {
+            y = -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * x - 0.20219683;
+        }
+        else if (kelvin <= 4000.0)
+        {
+            y = -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867;
+        }
+        else
+        {
+            y = 3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483;
+        }
+    }
+
+    // 线性光下的通道增益，以 6500K 为基准（6500K = 1,1,1），最大通道归一化为 1。
+    void KelvinLinearGains(double kelvin, double gains[3])
+    {
+        auto toRgb = [](double x, double y, double rgb[3])
+        {
+            const double X = x / y;
+            const double Z = (1.0 - x - y) / y;
+            rgb[0] = 3.2404542 * X - 1.5371385 - 0.4985314 * Z;
+            rgb[1] = -0.9692660 * X + 1.8760108 + 0.0415560 * Z;
+            rgb[2] = 0.0556434 * X - 0.2040259 + 1.0572252 * Z;
+        };
+
+        double targetX = 0.0;
+        double targetY = 0.0;
+        double baseX = 0.0;
+        double baseY = 0.0;
+        PlanckianChromaticity(kelvin, targetX, targetY);
+        PlanckianChromaticity(6500.0, baseX, baseY);
+
+        double target[3]{};
+        double base[3]{};
+        toRgb(targetX, targetY, target);
+        toRgb(baseX, baseY, base);
 
         for (int channel = 0; channel < 3; ++channel)
         {
-            for (int i = 0; i < 256; ++i)
+            gains[channel] = base[channel] > 0.0 ? target[channel] / base[channel] : 1.0;
+        }
+        const double maximum = std::max({gains[0], gains[1], gains[2]});
+        if (maximum > 0.0)
+        {
+            for (int channel = 0; channel < 3; ++channel)
             {
-                const double source = base
-                    ? base[channel * 256 + i] / 65535.0
-                    : i / 255.0;
-                const double value = std::clamp(source * gains[channel], 0.0, 1.0);
-                ramp[channel][i] = static_cast<WORD>(std::lround(value * 65535.0));
+                gains[channel] /= maximum;
             }
         }
+    }
+
+    // 滑块 0-100 -> 6500K..3400K。用 mired 线性插值，冷暖变化更均匀。
+    // 更暖的色温（3000K 以下）会被 SetDeviceGammaRamp 的单通道上限拒绝，这是 API 硬限制。
+    double KelvinForLevel(int level)
+    {
+        const double t = std::clamp(level, 0, 100) / 100.0;
+        const double startMired = 1.0e6 / 6500.0;
+        const double endMired = 1.0e6 / 3400.0;
+        return 1.0e6 / (startMired + (endMired - startMired) * t);
+    }
+
+    void BuildWarmRamp(const WORD* base, int level, WORD ramp[3][256])
+    {
+        double gains[3] = {1.0, 1.0, 1.0};
+        if (level > 0)
+        {
+            KelvinLinearGains(KelvinForLevel(level), gains);
+        }
+
+        auto build = [&](bool dither, WORD out[3][256])
+        {
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                double carry = 0.0;
+                WORD previous = 0;
+                for (int i = 0; i < 256; ++i)
+                {
+                    const double source = base ? base[channel * 256 + i] / 65535.0 : i / 255.0;
+                    // 在 sRGB 线性域缩放，再编码回去，色相随亮度保持稳定。
+                    const double linear = SrgbToLinear(source);
+                    const double scaled = std::clamp(linear * gains[channel], 0.0, 1.0);
+                    // 1D 误差扩散：把 16 位量化误差摊给下一个节点，减少长平台段
+                    // （映射到 8 位输出时就是渐变里的色带）。可在右键菜单里关闭。
+                    const double ideal = LinearToSrgb(scaled) * 65535.0 + carry;
+                    const double clamped = std::clamp(ideal, 0.0, 65535.0);
+                    WORD value = static_cast<WORD>(std::lround(clamped));
+                    carry = dither ? clamped - value : 0.0;
+                    if (value < previous)
+                    {
+                        value = previous;
+                    }
+                    previous = value;
+                    out[channel][i] = value;
+                }
+            }
+        };
+
+        build(g.lutDither, ramp);
     }
 
     void RestoreGammaRamps()
@@ -3914,11 +4023,8 @@ namespace
             return;
         }
 
-        const double t = level / 100.0;
-        const double gains[3] = {
-            1.0 - 0.01 * t,
-            1.0 - 0.15 * t,
-            1.0 - 0.48 * t};
+        double gains[3] = {1.0, 1.0, 1.0};
+        KelvinLinearGains(KelvinForLevel(level), gains);
 
         for (const std::wstring& name : g.displayService.GetActiveGdiNames())
         {
@@ -3936,9 +4042,13 @@ namespace
                 {
                     for (int i = 0; i < 256; ++i)
                     {
-                        const long value = std::lround(ramp[channel][i] / gains[channel]);
+                        // 反向：先线性化当前暖色 Ramp，除以增益，再编码回去。
+                        const double warmLinear = SrgbToLinear(ramp[channel][i] / 65535.0);
+                        const double baseLinear = std::clamp(
+                            warmLinear / std::max(0.05, gains[channel]), 0.0, 1.0);
+                        const double baseEncoded = LinearToSrgb(baseLinear);
                         ramp[channel][i] = static_cast<WORD>(
-                            std::clamp<long>(value, 0, 65535));
+                            std::clamp<long>(std::lround(baseEncoded * 65535.0), 0, 65535));
                     }
                 }
                 SetDeviceGammaRamp(dc, ramp);
@@ -5579,6 +5689,13 @@ namespace
             L"\xE7E8",
             true,
             StartupEnabled()});
+        items.push_back(MenuItem{
+            MenuItem::Kind::Action,
+            kMenuLutDither,
+            L"LUT 抖动",
+            L"\xE9D9",
+            true,
+            g.lutDither});
         items.push_back(MenuItem{MenuItem::Kind::Separator});
         items.push_back(MenuItem{
             MenuItem::Kind::Action,
@@ -5606,6 +5723,15 @@ namespace
             break;
         case kMenuStartup:
             SetStartupEnabled(!StartupEnabled());
+            break;
+        case kMenuLutDither:
+            g.lutDither = !g.lutDither;
+            WriteDword(
+                L"Software\\SdrBrightnessTray",
+                L"LutDither",
+                g.lutDither ? 1u : 0u);
+            // 立即按新设置重算一次暖色 Ramp（ApplyEyeCareRamp 始终从原始底色重建）。
+            ApplyEyeCareRamp();
             break;
         case kMenuDisplaySettings:
             OpenDisplaySettings();
@@ -6980,6 +7106,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             kDefaultTransparency)),
         0,
         100);
+    g.lutDither = ReadDword(
+        L"Software\\SdrBrightnessTray",
+        L"LutDither",
+        1) != 0;
 
     HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kMutexName);
     if (singleInstance && GetLastError() == ERROR_ALREADY_EXISTS)
