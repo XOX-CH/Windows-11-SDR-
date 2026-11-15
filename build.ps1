@@ -82,5 +82,31 @@ finally {
 
 $exe = Join-Path $bin 'SdrTray.exe'
 if (-not (Test-Path $exe)) { throw 'SdrTray.exe was not produced.' }
+
+# Authenticode 代码签名（可选）：配置证书后自动签名，减轻 SmartScreen 提示。
+#   SDR_SIGN_THUMBPRINT：证书指纹（证书已装入证书存储）
+#   SDR_SIGN_PFX + SDR_SIGN_PFX_PASSWORD：PFX 文件路径与密码
+$signThumbprint = $env:SDR_SIGN_THUMBPRINT
+$signPfx = $env:SDR_SIGN_PFX
+if ($signThumbprint -or $signPfx) {
+    $signtool = Get-ChildItem (Join-Path $sdkRoot 'bin') -Directory |
+        Where-Object { $_.Name -match '^10\.' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+        Where-Object { Test-Path $_ } |
+        Select-Object -First 1
+    if (-not $signtool) { throw 'signtool.exe not found.' }
+
+    $timestamp = 'http://timestamp.digicert.com'
+    if ($signThumbprint) {
+        & $signtool sign /sha1 $signThumbprint /fd SHA256 /tr $timestamp /td SHA256 $exe
+    }
+    else {
+        & $signtool sign /f $signPfx /p $env:SDR_SIGN_PFX_PASSWORD /fd SHA256 /tr $timestamp /td SHA256 $exe
+    }
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed: $LASTEXITCODE" }
+    "Signed $exe"
+}
+
 $item = Get-Item $exe
 "Built $($item.FullName) ($([math]::Round($item.Length / 1KB)) KB)"

@@ -33,6 +33,8 @@
 
 产物为 `bin\SdrTray.exe`。加 `-Clean` 可先清理 `obj` 与 `bin` 目录。
 
+代码签名（可选）：设置 `SDR_SIGN_THUMBPRINT`（证书已装入证书存储）或 `SDR_SIGN_PFX` + `SDR_SIGN_PFX_PASSWORD` 后，脚本会用 `signtool` 对产物做 SHA-256 时间戳签名。
+
 ## 环境要求
 
 - Windows 11 64 位（Windows 10 未验证）
