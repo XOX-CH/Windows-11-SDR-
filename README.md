@@ -35,7 +35,13 @@
 
 代码签名（可选）：设置 `SDR_SIGN_THUMBPRINT`（证书已装入证书存储）或 `SDR_SIGN_PFX` + `SDR_SIGN_PFX_PASSWORD` 后，脚本会用 `signtool` 对产物做 SHA-256 时间戳签名。
 
+开源发布计划通过 [SignPath Foundation](https://signpath.org/) 提供的免费 OV 级签名：`.github/workflows/build-sign.yml` 会在 GitHub 托管代理上构建并提交签名请求。审批通过后配置仓库 Secret `SIGNPATH_API_TOKEN` 与变量 `SIGNPATH_ORGANIZATION_ID` / `SIGNPATH_PROJECT_SLUG` / `SIGNPATH_SIGNING_POLICY_SLUG` 即可启用；未配置时工作流只产出未签名构建。
+
 ## 环境要求
 
 - Windows 11 64 位（Windows 10 未验证）
 - 显示器需开启 HDR
+
+## 许可证
+
+[MIT](LICENSE)
