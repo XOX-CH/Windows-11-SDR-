@@ -45,6 +45,8 @@ namespace
     constexpr UINT_PTR kHideTimerId = 1;
     constexpr UINT_PTR kSwitchTimerId = 3;
     constexpr UINT_PTR kTrayPromoteTimerId = 4;
+    constexpr UINT_PTR kEyeCareRefreshTimerId = 5;
+    constexpr int kEyeCareFadeMs = 1200;
     constexpr int kSwitchAnimMs = 160;
     constexpr int kWindowWidthDip = 320;
     constexpr int kWindowHeightDip = 184;
@@ -61,10 +63,12 @@ namespace
     constexpr UINT kAnimFrameMessage = WM_APP + 4;
     constexpr UINT kAnimDoneMessage = WM_APP + 5;
     constexpr UINT kDeferredMenuMessage = WM_APP + 6;
-    constexpr int kOpenAnimMs = 220;
+    constexpr UINT kEyeCareFadeFrameMessage = WM_APP + 7;
+    constexpr UINT kEyeCareFadeDoneMessage = WM_APP + 8;
+    constexpr int kOpenAnimMs = 140;   // 与右键菜单一致
     constexpr int kCloseAnimMs = 140;
-    constexpr int kOpenSlideDip = 22;
-    constexpr int kCloseSlideDip = 12;
+    constexpr int kOpenSlideDip = 6;   // 与右键菜单一致
+    constexpr int kCloseSlideDip = 6;
     constexpr int kWheelStep = 5;
     constexpr UINT kFlashHideMs = 1400;
 
@@ -75,7 +79,29 @@ namespace
     constexpr int kMenuDisplaySettings = 1003;
     constexpr int kMenuExit = 1004;
     constexpr int kMenuLutDither = 1005;
+    constexpr int kMenuToneAuto = 1006;
+    constexpr int kMenuToneDark = 1007;
+    constexpr int kMenuToneLight = 1008;
     constexpr int kMenuDisplayBase = 2000;
+
+    // 面板背景：0 深色 / 1 浅色 / 2 跟随系统。
+    bool IsToneMenuId(int id)
+    {
+        return id == kMenuToneAuto || id == kMenuToneDark || id == kMenuToneLight;
+    }
+
+    int ToneForMenuId(int id)
+    {
+        if (id == kMenuToneDark)
+        {
+            return 0;
+        }
+        if (id == kMenuToneLight)
+        {
+            return 1;
+        }
+        return 2;
+    }
 
     constexpr UINT_PTR kMenuSlideTimerId = 2;
     constexpr int kMenuSlideMs = 140;
@@ -128,6 +154,16 @@ namespace
         int to = 0;
         int duration = 0;
         bool opening = false;
+        unsigned generation = 0;
+    };
+
+    // 暖色淡入/淡出走独立线程，按 DwmFlush 跟随显示器刷新率，避免 30Hz 定时器造成的跳帧感。
+    struct EyeFadeJob
+    {
+        HWND window = nullptr;
+        float from = 0.0f;
+        float to = 0.0f;
+        int durationMs = 0;
         unsigned generation = 0;
     };
 
@@ -302,11 +338,26 @@ namespace
         ULONGLONG eyeSwitchAnimStart = 0;
         bool eyeSwitchAnimating = false;
         int transparency = kDefaultTransparency;
-        double backdropLuminance = 1.0;
-        bool backdropMeasured = false;
+        // 面板背景灰阶：0 深色 / 1 浅色 / 2 跟随系统，由右键菜单选择并持久化。
+        int panelTone = 0;
         bool promoteTrayOnStart = false;
         int trayPromoteAttempts = 0;
         bool lutDither = true;
+        ULONGLONG lastAcrylicApply = 0;
+        ULONGLONG lastMenuDismiss = 0;
+        bool eyeCareFading = false;
+        ULONGLONG eyeCareFadeStart = 0;
+        float eyeCareFadeFrom = 0.0f;
+        float eyeCareFadeTo = 0.0f;
+        std::thread eyeFadeThread;
+        std::mutex eyeFadeMutex;
+        std::condition_variable eyeFadeCv;
+        bool eyeFadeStop = false;
+        bool eyeFadePending = false;
+        EyeFadeJob eyeFadeJob;
+        std::atomic<unsigned> eyeFadeGeneration{0};
+        std::atomic<int> eyeFadeLevel10{0};
+        std::atomic<bool> eyeFadeFramePosted{false};
         std::vector<GammaBase> gammaBases;
         std::vector<AppliedRamp> appliedRamps;
         std::mutex rampMutex;
@@ -452,6 +503,8 @@ namespace
         bool enabled = true;
         bool checked = false;
         int sliderValue = 0;
+        // 只有会跳转到其他窗口的命令才收起菜单，开关类命令就地生效。
+        bool closeOnClick = true;
     };
 
     struct MenuFonts
@@ -535,83 +588,13 @@ namespace
         return RGB(red, green, blue);
     }
 
-    double ColorLuminance(COLORREF color)
-    {
-        return (0.2126 * GetRValue(color) + 0.7152 * GetGValue(color) +
-                0.0722 * GetBValue(color)) / 255.0;
-    }
-
-    // 采样窗口背后屏幕区域的平均亮度。面板/菜单是半透明玻璃，
-    // 配色要按合成后的实际亮度选择深浅，否则白底窗口下灰字和线条会看不清。
-    bool MeasureBackdropLuminance(int x, int y, int width, int height)
-    {
-        g.backdropMeasured = false;
-        if (width <= 0 || height <= 0)
-        {
-            return false;
-        }
-
-        HDC screen = GetDC(nullptr);
-        if (!screen)
-        {
-            return false;
-        }
-
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = width;
-        info.bmiHeader.biHeight = -height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        void* bits = nullptr;
-        HDC memory = CreateCompatibleDC(screen);
-        HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (memory && bitmap && bits)
-        {
-            HGDIOBJ old = SelectObject(memory, bitmap);
-            if (BitBlt(memory, 0, 0, width, height, screen, x, y, SRCCOPY | CAPTUREBLT))
-            {
-                constexpr int step = 6;
-                double total = 0.0;
-                int count = 0;
-                const auto* pixels = static_cast<const BYTE*>(bits);
-                for (int py = 0; py < height; py += step)
-                {
-                    const BYTE* row = pixels + static_cast<size_t>(py) * width * 4;
-                    for (int px = 0; px < width; px += step)
-                    {
-                        const BYTE* pixel = row + px * 4;
-                        total += 0.2126 * pixel[2] + 0.7152 * pixel[1] + 0.0722 * pixel[0];
-                        ++count;
-                    }
-                }
-                if (count > 0)
-                {
-                    g.backdropLuminance = total / count / 255.0;
-                    g.backdropMeasured = true;
-                }
-            }
-            SelectObject(memory, old);
-        }
-        if (bitmap)
-        {
-            DeleteObject(bitmap);
-        }
-        if (memory)
-        {
-            DeleteDC(memory);
-        }
-        ReleaseDC(nullptr, screen);
-        return g.backdropMeasured;
-    }
-
     void ShowFlyout();
     void HideFlyout();
     void HideWindowForSettings();
     void ExitApplication();
+    void ApplyMenuWindowAttributes();
     bool SystemAnimationsEnabled();
+    float EaseExit(float t);
     void ReleaseDWriteFormats();
 
     DWORD ReadDword(const wchar_t* subkey, const wchar_t* name, DWORD fallback)
@@ -781,6 +764,12 @@ namespace
         return lightTheme ? RGB(0, 103, 192) : RGB(96, 205, 255);
     }
 
+    // 亚克力染色与当前生效的明暗一致。
+    COLORREF PanelTintColor()
+    {
+        return g.lightTheme ? RGB(240, 240, 240) : RGB(30, 30, 30);
+    }
+
     void LoadTheme()
     {
         constexpr const wchar_t* personalize =
@@ -789,78 +778,52 @@ namespace
         const bool systemLight = ReadDword(personalize, L"AppsUseLightTheme", 0) != 0;
         g.lightTaskbar = ReadDword(personalize, L"SystemUsesLightTheme", 0) != 0;
 
-        // 半透明玻璃的最终观感由背后内容决定：估算玻璃合成后的亮度来选深浅配色，
-        // 这样白底窗口下不会出现灰字、分割线、HDR 徽标发灰发虚的问题。
-        g.lightTheme = systemLight;
-        if (g.backdropMeasured)
-        {
-            const double alpha = SurfaceAlpha() / 255.0;
-            const COLORREF tint = systemLight
-                ? BlendColor(RGB(242, 242, 242), ReadSystemAccent(true), 10)
-                : BlendColor(RGB(22, 22, 22), ReadSystemAccent(false), 32);
-            const double surfaceLuminance =
-                alpha * ColorLuminance(tint) + (1.0 - alpha) * g.backdropLuminance;
-            g.lightTheme = surfaceLuminance > 0.5;
-        }
-
-        // 强调色只跟系统主题走，不随背景明暗变 hue；浅色面板上压暗一档保证可读。
-        g.accent = ReadSystemAccent(systemLight);
-        if (g.lightTheme && !systemLight)
-        {
-            g.accent = BlendColor(g.accent, RGB(0, 0, 0), 25);
-        }
+        // 背景可在深色 / 浅色 / 跟随系统之间切换，不再随背后内容变化。
+        g.lightTheme = g.panelTone == 2 ? systemLight : g.panelTone == 1;
+        // 强调色按面板明暗取亮/暗两套，保证滑条、开关在灰底上的对比度。
+        g.accent = ReadSystemAccent(g.lightTheme);
 
         if (g.lightTheme)
         {
-            g.surface = RGB(249, 249, 249);
-            g.surfaceHighlight = RGB(255, 255, 255);
-            g.border = RGB(220, 220, 220);
-            g.card = RGB(255, 255, 255);
-            g.cardHover = RGB(250, 250, 250);
-            g.cardBorder = RGB(226, 226, 226);
-            g.badgeBackground = RGB(247, 247, 247);
-            g.badgeBorder = RGB(222, 222, 222);
-            g.hoverBackground = RGB(238, 238, 238);
+            g.surface = RGB(240, 240, 240);
+            g.surfaceHighlight = RGB(252, 252, 252);
+            g.border = RGB(206, 206, 206);
+            g.card = RGB(248, 248, 248);
+            g.cardHover = RGB(252, 252, 252);
+            g.cardBorder = RGB(212, 212, 212);
+            g.badgeBackground = RGB(232, 232, 232);
+            g.badgeBorder = RGB(208, 208, 208);
+            g.hoverBackground = RGB(226, 226, 226);
             g.textPrimary = RGB(26, 26, 26);
-            g.textSecondary = RGB(92, 92, 92);
-            g.textTertiary = RGB(132, 132, 132);
-            g.track = RGB(208, 208, 208);
+            g.textSecondary = RGB(88, 88, 88);
+            g.textTertiary = RGB(126, 126, 126);
+            g.track = RGB(196, 196, 196);
             g.hdrDot = RGB(15, 123, 15);
             g.error = RGB(196, 43, 28);
         }
         else
         {
-            g.surface = RGB(24, 24, 24);
-            g.surfaceHighlight = RGB(43, 43, 43);
-            g.border = RGB(64, 64, 64);
-            g.card = RGB(43, 43, 43);
-            g.cardHover = RGB(50, 50, 50);
-            g.cardBorder = RGB(64, 64, 64);
-            g.badgeBackground = RGB(53, 53, 53);
-            g.badgeBorder = RGB(82, 82, 82);
-            g.hoverBackground = RGB(53, 53, 53);
+            g.surface = RGB(36, 36, 36);
+            g.surfaceHighlight = RGB(56, 56, 56);
+            g.border = RGB(76, 76, 76);
+            g.card = RGB(52, 52, 52);
+            g.cardHover = RGB(60, 60, 60);
+            g.cardBorder = RGB(76, 76, 76);
+            g.badgeBackground = RGB(62, 62, 62);
+            g.badgeBorder = RGB(92, 92, 92);
+            g.hoverBackground = RGB(62, 62, 62);
             g.textPrimary = RGB(255, 255, 255);
-            g.textSecondary = RGB(198, 198, 198);
-            g.textTertiary = RGB(160, 160, 160);
-            g.track = RGB(90, 90, 90);
+            g.textSecondary = RGB(216, 216, 216);
+            g.textTertiary = RGB(184, 184, 184);
+            g.track = RGB(112, 112, 112);
             g.hdrDot = RGB(108, 203, 95);
             g.error = RGB(255, 141, 141);
         }
 
-        const int surfaceTint = g.lightTheme ? 14 : 48;
-        const int cardTint = g.lightTheme ? 8 : 32;
-        g.surface = BlendColor(g.surface, g.accent, surfaceTint);
-        g.surfaceTop = BlendColor(g.surface, RGB(255, 255, 255), g.lightTheme ? 6 : 3);
-        g.surfaceBottom = BlendColor(g.surface, RGB(0, 0, 0), g.lightTheme ? 2 : 7);
+        // 背景保持纯灰，不掺入强调色；强调色只用于滑条、开关等交互元素。
+        g.surfaceTop = BlendColor(g.surface, RGB(255, 255, 255), g.lightTheme ? 3 : 4);
+        g.surfaceBottom = BlendColor(g.surface, RGB(0, 0, 0), g.lightTheme ? 3 : 8);
         g.surfaceHighlight = BlendColor(g.surface, RGB(255, 255, 255), g.lightTheme ? 30 : 7);
-        g.border = BlendColor(g.border, g.accent, g.lightTheme ? 12 : 20);
-        g.card = BlendColor(g.card, g.accent, cardTint);
-        g.cardHover = BlendColor(g.card, RGB(255, 255, 255), g.lightTheme ? 2 : 5);
-        g.cardBorder = BlendColor(g.cardBorder, g.accent, g.lightTheme ? 10 : 24);
-        g.badgeBackground = BlendColor(g.badgeBackground, g.accent, g.lightTheme ? 5 : 12);
-        g.badgeBorder = BlendColor(g.badgeBorder, g.accent, g.lightTheme ? 10 : 18);
-        g.hoverBackground = BlendColor(g.hoverBackground, g.accent, g.lightTheme ? 5 : 12);
-        g.track = BlendColor(g.track, g.accent, g.lightTheme ? 8 : 14);
     }
 
     const wchar_t* PickFace(std::initializer_list<const wchar_t*> candidates, const wchar_t* fallback)
@@ -3057,13 +3020,15 @@ namespace
         AccentPolicy policy{};
         if (enable && IsWindows11OrGreater() && TransparencyEnabled())
         {
-            const COLORREF tint = g.lightTheme
-                ? BlendColor(RGB(242, 242, 242), g.accent, 10)
-                : BlendColor(RGB(22, 22, 22), g.accent, 32);
+            // 亚克力染色与面板底色一致，固定灰阶，不跟随背后内容。
+            const COLORREF tint = PanelTintColor();
             policy.state = 4;
             policy.flags = 0x20 | 0x40 | 0x80 | 0x100;
+            // 透明度 100% 时 alpha 为 0，DWM 会把它当成“无亚克力”，导致闪一下
+            // 且底色突然变暗；保留 3% 的极淡染色，肉眼不可见但材质连续。
+            const int acrylicAlpha = std::max(8, SurfaceAlpha());
             policy.gradientColor =
-                (static_cast<DWORD>(SurfaceAlpha()) << 24) |
+                (static_cast<DWORD>(acrylicAlpha) << 24) |
                 (static_cast<DWORD>(GetBValue(tint)) << 16) |
                 (static_cast<DWORD>(GetGValue(tint)) << 8) |
                 static_cast<DWORD>(GetRValue(tint));
@@ -3787,18 +3752,18 @@ namespace
 
     // 滑块 0-100 -> 6500K..3400K。用 mired 线性插值，冷暖变化更均匀。
     // 更暖的色温（3000K 以下）会被 SetDeviceGammaRamp 的单通道上限拒绝，这是 API 硬限制。
-    double KelvinForLevel(int level)
+    double KelvinForLevel(double level)
     {
-        const double t = std::clamp(level, 0, 100) / 100.0;
+        const double t = std::clamp(level, 0.0, 100.0) / 100.0;
         const double startMired = 1.0e6 / 6500.0;
         const double endMired = 1.0e6 / 3400.0;
         return 1.0e6 / (startMired + (endMired - startMired) * t);
     }
 
-    void BuildWarmRamp(const WORD* base, int level, WORD ramp[3][256])
+    void BuildWarmRamp(const WORD* base, double level, WORD ramp[3][256])
     {
         double gains[3] = {1.0, 1.0, 1.0};
-        if (level > 0)
+        if (level > 0.0)
         {
             KelvinLinearGains(KelvinForLevel(level), gains);
         }
@@ -3851,9 +3816,13 @@ namespace
         }
     }
 
-    void ApplyEyeCareRamp()
+    void ApplyEyeCareRamp(float levelOverride = -1.0f)
     {
-        const int level = g.eyeCare ? std::clamp(g.eyeCareLevel, 0, 100) : 0;
+        const double level = levelOverride >= 0.0f
+            ? std::clamp(static_cast<double>(levelOverride), 0.0, 100.0)
+            : (g.eyeCare
+                   ? std::clamp(static_cast<double>(g.eyeCareLevel), 0.0, 100.0)
+                   : 0.0);
         std::vector<AppliedRamp> snapshot;
         snapshot.reserve(g.gammaBases.size());
 
@@ -3862,7 +3831,7 @@ namespace
             AppliedRamp applied;
             applied.device = base.device;
 
-            if (level <= 0)
+            if (level <= 0.0)
             {
                 if (base.valid)
                 {
@@ -3895,6 +3864,151 @@ namespace
 
         std::lock_guard<std::mutex> lock(g.rampMutex);
         g.appliedRamps = std::move(snapshot);
+    }
+
+    void EyeFadeThreadLoop()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+
+        for (;;)
+        {
+            EyeFadeJob job;
+            {
+                std::unique_lock<std::mutex> lock(g.eyeFadeMutex);
+                g.eyeFadeCv.wait(lock, [] { return g.eyeFadeStop || g.eyeFadePending; });
+                if (g.eyeFadeStop)
+                {
+                    return;
+                }
+                job = g.eyeFadeJob;
+                g.eyeFadePending = false;
+            }
+
+            LARGE_INTEGER started{};
+            QueryPerformanceCounter(&started);
+            for (;;)
+            {
+                if (g.eyeFadeGeneration.load() != job.generation)
+                {
+                    break;
+                }
+
+                LARGE_INTEGER now{};
+                QueryPerformanceCounter(&now);
+                const double elapsedMs =
+                    static_cast<double>(now.QuadPart - started.QuadPart) * 1000.0 /
+                    static_cast<double>(frequency.QuadPart);
+                const double t = job.durationMs > 0
+                                     ? std::min(
+                                           1.0,
+                                           elapsedMs / static_cast<double>(job.durationMs))
+                                     : 1.0;
+                const double eased = t * t * (3.0 - 2.0 * t);
+                const float level = job.from + (job.to - job.from) * static_cast<float>(eased);
+
+                g.eyeFadeLevel10.store(static_cast<int>(std::lround(level * 10.0f)));
+                if (!g.eyeFadeFramePosted.exchange(true))
+                {
+                    PostMessageW(job.window, kEyeCareFadeFrameMessage, job.generation, 0);
+                }
+
+                if (t >= 1.0)
+                {
+                    PostMessageW(job.window, kEyeCareFadeDoneMessage, job.generation, 0);
+                    break;
+                }
+
+                // 跟随合成帧，实际帧率等于显示器刷新率。
+                DwmFlush();
+            }
+        }
+    }
+
+    void StartEyeCareFadeThread()
+    {
+        if (g.eyeFadeThread.joinable())
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g.eyeFadeMutex);
+            g.eyeFadeStop = false;
+            g.eyeFadePending = false;
+        }
+        g.eyeFadeThread = std::thread(EyeFadeThreadLoop);
+    }
+
+    void StopEyeCareFadeThread()
+    {
+        if (!g.eyeFadeThread.joinable())
+        {
+            return;
+        }
+        ++g.eyeFadeGeneration;
+        {
+            std::lock_guard<std::mutex> lock(g.eyeFadeMutex);
+            g.eyeFadeStop = true;
+            g.eyeFadePending = false;
+        }
+        g.eyeFadeCv.notify_all();
+        g.eyeFadeThread.join();
+    }
+
+    // 启动/开关时缓慢变暖，按显示器刷新率逐帧过渡。
+    void StartEyeCareFade(float from, float to, int durationMs)
+    {
+        if (!g.window || durationMs <= 0)
+        {
+            ApplyEyeCareRamp(to);
+            return;
+        }
+
+        StartEyeCareFadeThread();
+
+        g.eyeCareFading = true;
+        g.eyeCareFadeStart = GetTickCount64();
+        g.eyeCareFadeFrom = from;
+        g.eyeCareFadeTo = to;
+        ApplyEyeCareRamp(from);
+
+        const unsigned generation = ++g.eyeFadeGeneration;
+        g.eyeFadeFramePosted.store(false);
+        {
+            std::lock_guard<std::mutex> lock(g.eyeFadeMutex);
+            g.eyeFadeJob = EyeFadeJob{g.window, from, to, durationMs, generation};
+            g.eyeFadePending = true;
+        }
+        g.eyeFadeCv.notify_one();
+    }
+
+    void CancelEyeCareFade()
+    {
+        if (!g.eyeCareFading)
+        {
+            return;
+        }
+        g.eyeCareFading = false;
+        // 让正在跑的淡变线程在下一次循环时自行退出。
+        ++g.eyeFadeGeneration;
+    }
+
+    // 当前实际应用的暖色档位（淡入/淡出过程中取插值）。
+    float CurrentEyeCareLevel()
+    {
+        if (!g.eyeCareFading)
+        {
+            return g.eyeCare ? static_cast<float>(g.eyeCareLevel) : 0.0f;
+        }
+
+        const ULONGLONG elapsed = GetTickCount64() - g.eyeCareFadeStart;
+        const float t = std::clamp(
+            static_cast<float>(elapsed) / static_cast<float>(kEyeCareFadeMs),
+            0.0f,
+            1.0f);
+        const float eased = t * t * (3.0f - 2.0f * t);
+        return g.eyeCareFadeFrom + (g.eyeCareFadeTo - g.eyeCareFadeFrom) * eased;
     }
 
     // 亮度写入后 Windows 会在几十毫秒内把 Gamma 重置回默认。这里以 1ms 间隔
@@ -4004,68 +4118,62 @@ namespace
         CaptureGammaDevices();
     }
 
-    // 上次进程可能被强制结束、把暖色留在了屏幕上。启动时若护眼为开启状态且
-    // 当前 Ramp 明显偏暖，按当前档位反解回原始 Ramp，避免重启后越叠越暖。
-    void RepairLeftoverGamma()
+    // 退出时保留暖色 Ramp，下次启动捕获到的“本底”其实已经偏暖。
+    // 这里用当前档位的增益反解出原始 Ramp 存回 gammaBases（不写屏幕），
+    // 这样屏幕保持上次的暖色，后续调整也不会越叠越暖。
+    bool AdoptLeftoverWarmBases()
     {
-        constexpr const wchar_t* store = L"Software\\SdrBrightnessTray";
-        if (ReadDword(store, L"EyeCare", 0) == 0)
+        if (!g.eyeCare || g.eyeCareLevel <= 0)
         {
-            return;
-        }
-
-        const int level = std::clamp<int>(
-            static_cast<int>(ReadDword(store, L"EyeCareLevel", 50)),
-            0,
-            100);
-        if (level <= 0)
-        {
-            return;
+            return false;
         }
 
         double gains[3] = {1.0, 1.0, 1.0};
-        KelvinLinearGains(KelvinForLevel(level), gains);
+        KelvinLinearGains(KelvinForLevel(g.eyeCareLevel), gains);
 
-        for (const std::wstring& name : g.displayService.GetActiveGdiNames())
+        bool adopted = false;
+        for (GammaBase& base : g.gammaBases)
         {
-            HDC dc = CreateDCW(nullptr, name.c_str(), nullptr, nullptr);
-            if (!dc)
+            if (!base.valid || base.ramp[0][255] <= base.ramp[2][255] + 512)
             {
                 continue;
             }
 
-            WORD ramp[3][256]{};
-            if (GetDeviceGammaRamp(dc, &ramp[0][0]) &&
-                ramp[0][255] > ramp[2][255] + 512)
+            adopted = true;
+            for (int channel = 0; channel < 3; ++channel)
             {
-                for (int channel = 0; channel < 3; ++channel)
+                for (int i = 0; i < 256; ++i)
                 {
-                    for (int i = 0; i < 256; ++i)
-                    {
-                        // 反向：先线性化当前暖色 Ramp，除以增益，再编码回去。
-                        const double warmLinear = SrgbToLinear(ramp[channel][i] / 65535.0);
-                        const double baseLinear = std::clamp(
-                            warmLinear / std::max(0.05, gains[channel]), 0.0, 1.0);
-                        const double baseEncoded = LinearToSrgb(baseLinear);
-                        ramp[channel][i] = static_cast<WORD>(
-                            std::clamp<long>(std::lround(baseEncoded * 65535.0), 0, 65535));
-                    }
+                    // 反向：先线性化当前暖色 Ramp，除以增益，再编码回去。
+                    const double warmLinear = SrgbToLinear(base.ramp[channel][i] / 65535.0);
+                    const double baseLinear = std::clamp(
+                        warmLinear / std::max(0.05, gains[channel]), 0.0, 1.0);
+                    const double baseEncoded = LinearToSrgb(baseLinear);
+                    base.ramp[channel][i] = static_cast<WORD>(
+                        std::clamp<long>(std::lround(baseEncoded * 65535.0), 0, 65535));
                 }
-                SetDeviceGammaRamp(dc, ramp);
             }
-            DeleteDC(dc);
         }
+        return adopted;
     }
 
     // 打开护眼时先关掉系统夜间模式，等它撤掉自己的 Gamma 后再采样本底。
-    void ActivateEyeCare()
+    void ActivateEyeCare(bool fadeIn = false, float fadeFrom = 0.0f)
     {
         if (DisableSystemNightLight())
         {
             Sleep(90);
             CaptureGammaDevices();
         }
-        ApplyEyeCareRamp();
+
+        if (fadeIn && g.eyeCare && g.eyeCareLevel > 0)
+        {
+            StartEyeCareFade(fadeFrom, static_cast<float>(g.eyeCareLevel), kEyeCareFadeMs);
+        }
+        else
+        {
+            ApplyEyeCareRamp();
+        }
     }
 
     void SaveEyeCareSettings()
@@ -4085,13 +4193,25 @@ namespace
             0,
             100);
         g.eyeSwitchVisual = g.eyeCare ? 1.0f : 0.0f;
-        if (g.eyeCare)
+    }
+
+    // 启动时应用护眼：若上次退出保留了暖色，直接沿用，不再做一次变暖过渡。
+    void ApplyEyeCareOnLaunch()
+    {
+        if (!g.eyeCare)
         {
-            ActivateEyeCare();
+            ApplyEyeCareRamp();
+            return;
+        }
+
+        if (AdoptLeftoverWarmBases())
+        {
+            ApplyEyeCareRamp();
         }
         else
         {
-            ApplyEyeCareRamp();
+            // 暖色已被显示驱动重置（例如重启后），按设置重新渐入。
+            ActivateEyeCare(true);
         }
     }
 
@@ -4119,19 +4239,18 @@ namespace
 
     void ToggleEyeCare()
     {
+        const float from = CurrentEyeCareLevel();
+        CancelEyeCareFade();
         g.eyeCare = !g.eyeCare;
-        if (g.eyeCare && g.eyeCareLevel < 10)
-        {
-            g.eyeCareLevel = 50;
-        }
         SaveEyeCareSettings();
         if (g.eyeCare)
         {
-            ActivateEyeCare();
+            ActivateEyeCare(true, from);
         }
         else
         {
-            ApplyEyeCareRamp();
+            // 关闭时也缓慢淡出，避免整屏色彩突然跳回中性。
+            StartEyeCareFade(from, 0.0f, kEyeCareFadeMs);
         }
         UpdateTrayTooltip();
         AnimateEyeSwitch();
@@ -4147,6 +4266,7 @@ namespace
         }
 
         g.eyeCareLevel = percent;
+        CancelEyeCareFade();
         ApplyEyeCareRamp();
         if (!g.dragging)
         {
@@ -4343,7 +4463,179 @@ namespace
         InvalidateUi();
     }
 
-    bool StartupEnabled()
+    constexpr wchar_t kStartupTaskName[] = L"SdrBrightnessTray";
+
+    bool RunHiddenCommand(const std::wstring& commandLine)
+    {
+        std::wstring command = commandLine;
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(
+                nullptr,
+                command.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &startup,
+                &process))
+        {
+            return false;
+        }
+
+        const DWORD wait = WaitForSingleObject(process.hProcess, 15000);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(process.hProcess, &exitCode);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return wait == WAIT_OBJECT_0 && exitCode == 0;
+    }
+
+    // 任务计划把任务以 XML 存在 System32\Tasks 下，读属性比每次调用 schtasks 快得多。
+    bool StartupTaskExists()
+    {
+        wchar_t windows[MAX_PATH]{};
+        if (!GetWindowsDirectoryW(windows, MAX_PATH))
+        {
+            return false;
+        }
+        const std::wstring file =
+            std::wstring(windows) + L"\\System32\\Tasks\\" + kStartupTaskName;
+        return GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+
+    void DeleteStartupTask()
+    {
+        RunHiddenCommand(
+            L"schtasks.exe /Delete /TN \"" + std::wstring(kStartupTaskName) + L"\" /F");
+    }
+
+    std::wstring XmlEscape(const std::wstring& text)
+    {
+        std::wstring escaped;
+        escaped.reserve(text.size());
+        for (wchar_t ch : text)
+        {
+            switch (ch)
+            {
+            case L'&':
+                escaped += L"&amp;";
+                break;
+            case L'<':
+                escaped += L"&lt;";
+                break;
+            case L'>':
+                escaped += L"&gt;";
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+            }
+        }
+        return escaped;
+    }
+
+    // 用「登录时触发」的计划任务自启：Run 键要等资源管理器就绪后才会执行，
+    // 计划任务由任务计划服务在登录时直接拉起，能更早启动。
+    bool CreateStartupTask()
+    {
+        wchar_t executable[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, executable, MAX_PATH))
+        {
+            return false;
+        }
+
+        wchar_t computer[64]{};
+        DWORD computerLength = 64;
+        wchar_t user[256]{};
+        DWORD userLength = 256;
+        if (!GetComputerNameW(computer, &computerLength) ||
+            !GetUserNameW(user, &userLength))
+        {
+            return false;
+        }
+
+        const std::wstring account = XmlEscape(std::wstring(computer) + L"\\" + user);
+        const std::wstring command = XmlEscape(executable);
+
+        std::wstring xml =
+            L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+            L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+            L"  <RegistrationInfo><Description>SDR 亮度开机自启</Description></RegistrationInfo>\r\n"
+            L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>";
+        xml += account;
+        xml += L"</UserId></LogonTrigger></Triggers>\r\n"
+               L"  <Principals><Principal id=\"Author\"><UserId>";
+        xml += account;
+        xml += L"</UserId><LogonType>InteractiveToken</LogonType>"
+               L"<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n"
+               L"  <Settings>\r\n"
+               L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+               L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+               L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+               L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+               L"    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
+               L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+               L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+               L"    <Enabled>true</Enabled>\r\n"
+               L"    <Hidden>false</Hidden>\r\n"
+               L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+               L"    <WakeToRun>false</WakeToRun>\r\n"
+               L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+               L"  </Settings>\r\n"
+               L"  <Actions Context=\"Author\"><Exec><Command>";
+        xml += command;
+        xml += L"</Command><Arguments>--background</Arguments></Exec></Actions>\r\n"
+               L"</Task>\r\n";
+
+        wchar_t tempPath[MAX_PATH]{};
+        if (!GetTempPathW(MAX_PATH, tempPath))
+        {
+            return false;
+        }
+        const std::wstring file = std::wstring(tempPath) + L"SdrTrayStartupTask.xml";
+
+        HANDLE handle = CreateFileW(
+            file.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY,
+            nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const WORD bom = 0xFEFF;
+        DWORD written = 0;
+        bool ok = WriteFile(handle, &bom, sizeof(bom), &written, nullptr) != FALSE;
+        if (ok)
+        {
+            ok = WriteFile(
+                     handle,
+                     xml.c_str(),
+                     static_cast<DWORD>(xml.size() * sizeof(wchar_t)),
+                     &written,
+                     nullptr) != FALSE;
+        }
+        CloseHandle(handle);
+
+        if (ok)
+        {
+            ok = RunHiddenCommand(
+                L"schtasks.exe /Create /TN \"" + std::wstring(kStartupTaskName) +
+                L"\" /XML \"" + file + L"\" /F");
+        }
+        DeleteFileW(file.c_str());
+        return ok;
+    }
+
+    bool LegacyStartupEntryExists()
     {
         const std::wstring command = ReadString(
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -4363,7 +4655,22 @@ namespace
         return _wcsnicmp(command.c_str(), prefix.c_str(), prefix.size()) == 0;
     }
 
-    void SetStartupEnabled(bool enabled)
+    void DeleteStartupRunEntry()
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                0,
+                KEY_SET_VALUE,
+                &key) == ERROR_SUCCESS)
+        {
+            RegDeleteValueW(key, L"SdrBrightnessTray");
+            RegCloseKey(key);
+        }
+    }
+
+    bool WriteStartupRunEntry()
     {
         HKEY key = nullptr;
         if (RegCreateKeyExW(
@@ -4377,28 +4684,46 @@ namespace
                 &key,
                 nullptr) != ERROR_SUCCESS)
         {
+            return false;
+        }
+
+        wchar_t executable[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, executable, MAX_PATH);
+        const std::wstring command = L"\"" + std::wstring(executable) + L"\" --background";
+        const LONG result = RegSetValueExW(
+            key,
+            L"SdrBrightnessTray",
+            0,
+            REG_SZ,
+            reinterpret_cast<const BYTE*>(command.c_str()),
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+        return result == ERROR_SUCCESS;
+    }
+
+    bool StartupEnabled()
+    {
+        return StartupTaskExists() || LegacyStartupEntryExists();
+    }
+
+    void SetStartupEnabled(bool enabled)
+    {
+        if (enabled)
+        {
+            // 优先用计划任务；创建失败时退回传统的 Run 键。
+            if (CreateStartupTask())
+            {
+                DeleteStartupRunEntry();
+            }
+            else
+            {
+                WriteStartupRunEntry();
+            }
             return;
         }
 
-        if (enabled)
-        {
-            wchar_t executable[MAX_PATH]{};
-            GetModuleFileNameW(nullptr, executable, MAX_PATH);
-            const std::wstring command = L"\"" + std::wstring(executable) + L"\" --background";
-            RegSetValueExW(
-                key,
-                L"SdrBrightnessTray",
-                0,
-                REG_SZ,
-                reinterpret_cast<const BYTE*>(command.c_str()),
-                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-        }
-        else
-        {
-            RegDeleteValueW(key, L"SdrBrightnessTray");
-        }
-
-        RegCloseKey(key);
+        DeleteStartupTask();
+        DeleteStartupRunEntry();
     }
 
     void OpenDisplaySettings()
@@ -4446,12 +4771,34 @@ namespace
         return MulDiv(dip, menu.dpi > 0 ? menu.dpi : 96, 96);
     }
 
+    // 拖动透明度时每个像素都改一次 DWM 亚克力参数，调用过密会造成闪烁；
+    // 这里限制到约 20Hz，松手时再强制应用最终值。
+    void UpdateAcrylicForTransparency(bool force)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (!force && now - g.lastAcrylicApply < 50)
+        {
+            return;
+        }
+        g.lastAcrylicApply = now;
+
+        if (g.window && IsWindowVisible(g.window))
+        {
+            ApplyAcrylicEffect(true);
+        }
+        if (menu.window && IsWindowVisible(menu.window))
+        {
+            ApplyAcrylicEffect(true, menu.window);
+        }
+    }
+
     void SaveTransparency()
     {
         WriteDword(
             L"Software\\SdrBrightnessTray",
             L"Transparency",
             static_cast<DWORD>(std::clamp(g.transparency, 0, 100)));
+        UpdateAcrylicForTransparency(true);
     }
 
     void SetTransparency(int percent, bool persist)
@@ -4469,17 +4816,12 @@ namespace
         g.transparency = percent;
         if (persist)
         {
+            // SaveTransparency 内部会强制应用一次亚克力。
             SaveTransparency();
         }
-
-        // 面板与菜单共用同一透明度：重应用亚克力并重绘。
-        if (g.window)
+        else
         {
-            ApplyAcrylicEffect(true);
-        }
-        if (menu.window)
-        {
-            ApplyAcrylicEffect(true, menu.window);
+            UpdateAcrylicForTransparency(false);
         }
 
         g.sceneDirty = true;
@@ -4495,6 +4837,36 @@ namespace
             {
                 menu.items[menu.sliderIndex].sliderValue = percent;
             }
+            menu.sceneDirty = true;
+            InvalidateRect(menu.window, nullptr, FALSE);
+        }
+    }
+
+    void SetPanelTone(int tone)
+    {
+        tone = std::clamp(tone, 0, 2);
+        if (tone == g.panelTone)
+        {
+            return;
+        }
+
+        g.panelTone = tone;
+        WriteDword(
+            L"Software\\SdrBrightnessTray",
+            L"PanelTone",
+            static_cast<DWORD>(tone));
+        LoadTheme();
+        ApplyWindowAttributes();
+
+        if (g.isOpen)
+        {
+            g.sceneDirty = true;
+            InvalidateRect(g.window, nullptr, FALSE);
+        }
+        if (menu.shown)
+        {
+            ApplyMenuWindowAttributes();
+            menu.liveAcrylic = ApplyAcrylicEffect(true, menu.window);
             menu.sceneDirty = true;
             InvalidateRect(menu.window, nullptr, FALSE);
         }
@@ -5034,7 +5406,7 @@ namespace
         return -1;
     }
 
-    void CloseCustomMenu(int result)
+    void CloseCustomMenu(int result, bool dismissedByFocusLoss = false)
     {
         if (!menu.shown)
         {
@@ -5046,9 +5418,49 @@ namespace
             menu.draggingSlider = false;
             SaveTransparency();
         }
+        if (dismissedByFocusLoss)
+        {
+            // 点托盘图标会先让菜单失活；紧接着的托盘右键消息不该把菜单又打开。
+            g.lastMenuDismiss = GetTickCount64();
+        }
         menu.shown = false;
         menu.result = result;
         KillTimer(menu.window, kMenuSlideTimerId);
+
+        // 和主面板一致：先沿出场方向滑出，再隐藏，避免“啪”地消失。
+        if (SystemAnimationsEnabled() && menu.slideFrom != 0 &&
+            menu.target.right > menu.target.left)
+        {
+            LARGE_INTEGER frequency{};
+            LARGE_INTEGER started{};
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&started);
+            for (;;)
+            {
+                LARGE_INTEGER now{};
+                QueryPerformanceCounter(&now);
+                const double elapsedMs =
+                    static_cast<double>(now.QuadPart - started.QuadPart) * 1000.0 /
+                    static_cast<double>(frequency.QuadPart);
+                const double t = std::min(1.0, elapsedMs / kMenuSlideMs);
+                const double eased = static_cast<double>(EaseExit(static_cast<float>(t)));
+                const int offset = static_cast<int>(std::lround(menu.slideFrom * eased));
+                SetWindowPos(
+                    menu.window,
+                    nullptr,
+                    menu.target.left,
+                    menu.target.top + offset,
+                    menu.target.right - menu.target.left,
+                    menu.target.bottom - menu.target.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                if (t >= 1.0)
+                {
+                    break;
+                }
+                DwmFlush();
+            }
+        }
+
         ShowWindow(menu.window, SW_HIDE);
     }
 
@@ -5277,7 +5689,49 @@ namespace
                 menu.items[index].kind == MenuItem::Kind::Action &&
                 menu.items[index].enabled)
             {
-                CloseCustomMenu(menu.items[index].id);
+                MenuItem& item = menu.items[index];
+                if (!item.closeOnClick)
+                {
+                    // 开关 / 就地执行的命令：立即生效，菜单保持打开。
+                    if (item.id == kMenuStartup)
+                    {
+                        SetStartupEnabled(!StartupEnabled());
+                        item.checked = StartupEnabled();
+                    }
+                    else if (item.id == kMenuLutDither)
+                    {
+                        g.lutDither = !g.lutDither;
+                        WriteDword(
+                            L"Software\\SdrBrightnessTray",
+                            L"LutDither",
+                            g.lutDither ? 1u : 0u);
+                        CancelEyeCareFade();
+                        ApplyEyeCareRamp();
+                        item.checked = g.lutDither;
+                    }
+                    else if (item.id == kMenuSync)
+                    {
+                        SyncAllDisplays();
+                    }
+                    else if (IsToneMenuId(item.id))
+                    {
+                        SetPanelTone(ToneForMenuId(item.id));
+                        for (MenuItem& other : menu.items)
+                        {
+                            if (IsToneMenuId(other.id))
+                            {
+                                other.checked = ToneForMenuId(other.id) == g.panelTone;
+                            }
+                        }
+                    }
+
+                    menu.hover = index;
+                    menu.sceneDirty = true;
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+
+                CloseCustomMenu(item.id);
                 return 0;
             }
             InvalidateRect(window, nullptr, FALSE);
@@ -5295,7 +5749,7 @@ namespace
                 // 的失活才代表用户点到别处了。
                 if (menu.activated)
                 {
-                    CloseCustomMenu(0);
+                    CloseCustomMenu(0, true);
                 }
             }
             else
@@ -5517,13 +5971,6 @@ namespace
         }
         menu.slideStart = GetTickCount64();
 
-        // 面板没开时，菜单按自己背后的内容选深浅；面板已开就沿用它测好的配色。
-        if (!g.isOpen &&
-            MeasureBackdropLuminance(menu.target.left, menu.target.top, menu.width, menu.height))
-        {
-            LoadTheme();
-        }
-
         SetWindowPos(
             menu.window,
             HWND_TOPMOST,
@@ -5645,6 +6092,15 @@ namespace
 
     void ShowMainMenu(bool fromTray)
     {
+        // 菜单刚因点击托盘图标而失活收起时，同一次点击带来的托盘右键消息应忽略，
+        // 否则菜单会立刻又被重新打开，看起来“关不掉”。
+        if (fromTray && g.lastMenuDismiss != 0 &&
+            GetTickCount64() - g.lastMenuDismiss < 300)
+        {
+            g.lastMenuDismiss = 0;
+            return;
+        }
+
         std::vector<MenuItem> items;
         items.push_back(MenuItem{
             MenuItem::Kind::Action, kMenuOpen, L"打开面板", L"\xE8A7", true, false});
@@ -5681,6 +6137,8 @@ namespace
             L"同步所有显示器",
             L"\xE895",
             g.hasHdr && g.displays.size() > 1,
+            false,
+            0,
             false});
         items.push_back(MenuItem{
             MenuItem::Kind::Action,
@@ -5688,14 +6146,47 @@ namespace
             L"开机时启动",
             L"\xE7E8",
             true,
-            StartupEnabled()});
+            StartupEnabled(),
+            0,
+            false});
         items.push_back(MenuItem{
             MenuItem::Kind::Action,
             kMenuLutDither,
             L"LUT 抖动",
             L"\xE9D9",
             true,
-            g.lutDither});
+            g.lutDither,
+            0,
+            false});
+        items.push_back(MenuItem{MenuItem::Kind::Separator});
+        items.push_back(MenuItem{MenuItem::Kind::Info, 0, L"面板背景"});
+        items.push_back(MenuItem{
+            MenuItem::Kind::Action,
+            kMenuToneAuto,
+            L"跟随系统",
+            nullptr,
+            true,
+            g.panelTone == 2,
+            0,
+            false});
+        items.push_back(MenuItem{
+            MenuItem::Kind::Action,
+            kMenuToneDark,
+            L"深色",
+            nullptr,
+            true,
+            g.panelTone == 0,
+            0,
+            false});
+        items.push_back(MenuItem{
+            MenuItem::Kind::Action,
+            kMenuToneLight,
+            L"浅色",
+            nullptr,
+            true,
+            g.panelTone == 1,
+            0,
+            false});
         items.push_back(MenuItem{MenuItem::Kind::Separator});
         items.push_back(MenuItem{
             MenuItem::Kind::Action,
@@ -5731,6 +6222,7 @@ namespace
                 L"LutDither",
                 g.lutDither ? 1u : 0u);
             // 立即按新设置重算一次暖色 Ramp（ApplyEyeCareRamp 始终从原始底色重建）。
+            CancelEyeCareFade();
             ApplyEyeCareRamp();
             break;
         case kMenuDisplaySettings:
@@ -5816,10 +6308,12 @@ namespace
         return BezierComponent(t, y1, y2);
     }
 
-    // 进场 cubic-bezier(0.2, 0, 0, 1)：Material emphasized / 华为 EaseOut 的等价观感
+    // 与右键菜单完全一致的 ease-out cubic
     float EaseEnter(float t)
     {
-        return static_cast<float>(SolveBezier(0.2, 0.0, 0.0, 1.0, t));
+        const float clamped = std::clamp(t, 0.0f, 1.0f);
+        const float inverse = 1.0f - clamped;
+        return 1.0f - inverse * inverse * inverse;
     }
 
     // 出场 cubic-bezier(0.3, 0, 1, 1)：Material standard accelerate / 华为 EaseIn
@@ -6083,14 +6577,6 @@ namespace
         y = std::max(static_cast<int>(monitorInfo.rcWork.top) + margin, y);
 
         const bool wasVisible = IsWindowVisible(g.window) != FALSE;
-        if (!wasVisible)
-        {
-            // 先看这块屏幕区域现在是什么（面板还没显示），再决定深/浅配色。
-            if (MeasureBackdropLuminance(x, y, width, height))
-            {
-                LoadTheme();
-            }
-        }
         SetWindowPos(
             g.window,
             HWND_TOPMOST,
@@ -6310,7 +6796,7 @@ namespace
         }
         UnregisterHotkeys();
         RemoveTrayIcon();
-        RestoreGammaRamps();
+        // 护眼开启时保留已写入的暖色 Ramp，退出后效果继续生效。
         DestroyFonts();
         DestroyBackBuffer();
         DestroyBackdrop();
@@ -6808,6 +7294,15 @@ namespace
                 }
                 InvalidateUi();
             }
+            else if (wParam == kEyeCareRefreshTimerId)
+            {
+                KillTimer(window, kEyeCareRefreshTimerId);
+                // 自启可能早于显示驱动/色彩配置就绪，稍后再写一次，防止暖色被重置。
+                if (g.eyeCare)
+                {
+                    ApplyEyeCareRamp();
+                }
+            }
             else if (wParam == kTrayPromoteTimerId)
             {
                 KillTimer(window, kTrayPromoteTimerId);
@@ -6831,6 +7326,23 @@ namespace
                 {
                     g.promoteTrayOnStart = false;
                 }
+            }
+            return 0;
+
+        case kEyeCareFadeFrameMessage:
+            g.eyeFadeFramePosted.store(false);
+            if (static_cast<unsigned>(wParam) == g.eyeFadeGeneration.load() &&
+                g.eyeCareFading)
+            {
+                ApplyEyeCareRamp(static_cast<float>(g.eyeFadeLevel10.load()) / 10.0f);
+            }
+            return 0;
+
+        case kEyeCareFadeDoneMessage:
+            if (static_cast<unsigned>(wParam) == g.eyeFadeGeneration.load())
+            {
+                g.eyeCareFading = false;
+                ApplyEyeCareRamp(static_cast<float>(g.eyeFadeLevel10.load()) / 10.0f);
             }
             return 0;
 
@@ -6916,8 +7428,7 @@ namespace
         {
             const bool oldLightTaskbar = g.lightTaskbar;
             const bool wasLive = g.liveAcrylic;
-            // 系统主题变了就直接跟系统走，下次弹出时再按背景重新测。
-            g.backdropMeasured = false;
+            // 灰阶底色固定，只重新读取系统强调色与任务栏明暗。
             LoadTheme();
             ApplyWindowAttributes();
             if (wasLive != g.liveAcrylic)
@@ -6944,6 +7455,7 @@ namespace
             RefreshGammaDevices();
             if (g.eyeCare)
             {
+                CancelEyeCareFade();
                 ApplyEyeCareRamp();
             }
             if (g.isOpen)
@@ -6980,7 +7492,7 @@ namespace
 
         case WM_DESTROY:
             RemoveTrayIcon();
-            RestoreGammaRamps();
+            // 不还原 Gamma：护眼效果在退出后保持，下次启动直接沿用。
             if (menu.window)
             {
                 KillTimer(menu.window, kMenuSlideTimerId);
@@ -7097,6 +7609,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     ULONG_PTR gdiplusToken = 0;
     g.gdiplusReady =
         Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok;
+    g.panelTone = std::clamp<int>(
+        static_cast<int>(ReadDword(
+            L"Software\\SdrBrightnessTray",
+            L"PanelTone",
+            0)),
+        0,
+        2);
     LoadTheme();
     InitializeDirectWrite();
     g.transparency = std::clamp<int>(
@@ -7114,7 +7633,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kMutexName);
     if (singleInstance && GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        ActivateExistingInstance();
+        // 自启可能同时命中计划任务和 Run 键：后来的后台实例直接退出，不弹面板。
+        if (!IsBackgroundLaunch())
+        {
+            ActivateExistingInstance();
+        }
         CloseHandle(singleInstance);
         return 0;
     }
@@ -7125,6 +7648,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         SetStartupEnabled(true);
         WriteDword(L"Software\\SdrBrightnessTray", L"Initialized", 1);
         g.promoteTrayOnStart = true;
+    }
+    else if (LegacyStartupEntryExists() && !StartupTaskExists())
+    {
+        // 旧版本用 Run 键自启，迁移到登录计划任务以获得更早的启动时机。
+        if (CreateStartupTask())
+        {
+            DeleteStartupRunEntry();
+        }
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -7175,9 +7706,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     InitializeLiveBoost();
     StartBrightnessWriter();
     RefreshDisplays();
-    RepairLeftoverGamma();
-    RefreshGammaDevices();
     LoadEyeCareSettings();
+    // 直接捕获当前 Ramp（可能已是上次退出保留的暖色），再按需校正本底并沿用。
+    CaptureGammaDevices();
+    ApplyEyeCareOnLaunch();
+    if (g.eyeCare)
+    {
+        // 开机自启时可能早于显示驱动就绪，几秒后补写一次暖色 Ramp。
+        SetTimer(g.window, kEyeCareRefreshTimerId, 4000, nullptr);
+    }
     UpdateTrayTooltip();
     AddTrayIcon();
     RegisterHotkeys();
@@ -7200,6 +7737,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     UnregisterHotkeys();
     StopAnimThread();
+    StopEyeCareFadeThread();
     StopBrightnessWriter();
     RemoveTrayIcon();
     DestroyFonts();
